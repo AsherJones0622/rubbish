@@ -1,0 +1,270 @@
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from typing import List, Dict, Tuple
+
+# 数据库初始化脚本
+DB_SCHEMA = [
+    '''CREATE TABLE IF NOT EXISTS students (
+        student_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        gender TEXT CHECK(gender IN ('男', '女')),
+        class TEXT,
+        enroll_date DATE,
+        credits_earned REAL DEFAULT 0
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS teachers (
+        teacher_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT,
+        courses TEXT  -- 存储任教课程代码，逗号分隔
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS courses (
+        course_code TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        credit REAL,
+        course_type TEXT CHECK(course_type IN ('必修', '选修')),
+        semester TEXT,
+        prerequisite TEXT,
+        time_slot TEXT  -- 格式：星期几-节次（如 周一-1,2）
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS enrollments (
+        student_id TEXT,
+        course_code TEXT,
+        enrollment_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT CHECK(status IN ('已选', '已退', '已完成')),
+        PRIMARY KEY (student_id, course_code),
+        FOREIGN KEY(student_id) REFERENCES students(student_id),
+        FOREIGN KEY(course_code) REFERENCES courses(course_code)
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS grades (
+        student_id TEXT,
+        course_code TEXT,
+        score REAL CHECK(score BETWEEN 0 AND 100),
+        status TEXT DEFAULT '待审核',
+        audit_log TEXT,
+        PRIMARY KEY (student_id, course_code)
+    )'''
+]
+
+class DatabaseManager:
+    """数据库管理类"""
+    def __init__(self, db_name='school.db'):
+        self.conn = sqlite3.connect(db_name)
+        self._initialize_db()
+    
+    def _initialize_db(self):
+        """初始化数据库结构"""
+        cursor = self.conn.cursor()
+        for statement in DB_SCHEMA:
+            cursor.execute(statement)
+        self.conn.commit()
+    
+    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        """执行SQL语句"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            self.conn.commit()
+            return cursor
+        except sqlite3.Error as e:
+            print(f"数据库错误: {e}")
+            raise
+
+class CourseManager:
+    """课程管理模块"""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+    
+    def add_course(self, course_data: Dict):
+        """添加新课程"""
+        query = '''INSERT INTO courses 
+                 (course_code, name, credit, course_type, semester, prerequisite, time_slot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'''
+        self.db.execute(query, tuple(course_data.values()))
+    
+    def get_course_schedule(self, course_code: str) -> Dict:
+        """获取课程时间安排"""
+        query = "SELECT time_slot FROM courses WHERE course_code = ?"
+        result = self.db.execute(query, (course_code,)).fetchone()
+        return {'time_slot': result[0]} if result else None
+
+class EnrollmentManager:
+    """选课管理模块"""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+    
+    def enroll_course(self, student_id: str, course_code: str) -> bool:
+        """学生选课"""
+        # 检查时间冲突
+        if self._check_schedule_conflict(student_id, course_code):
+            return False
+        
+        # 检查先修课程
+        if not self._check_prerequisites(student_id, course_code):
+            return False
+        
+        query = '''INSERT INTO enrollments 
+                 (student_id, course_code, status)
+                 VALUES (?, ?, '已选')'''
+        self.db.execute(query, (student_id, course_code))
+        return True
+    
+    def _check_schedule_conflict(self, student_id: str, new_course: str) -> bool:
+        """检查时间冲突"""
+        # 获取学生已选课程时间
+        query = '''SELECT c.time_slot 
+                 FROM enrollments e
+                 JOIN courses c ON e.course_code = c.course_code
+                 WHERE e.student_id = ? AND e.status = '已选' '''
+        enrolled = self.db.execute(query, (student_id,)).fetchall()
+        
+        # 获取新课程时间
+        new_time = self.db.execute(
+            "SELECT time_slot FROM courses WHERE course_code = ?",
+            (new_course,)
+        ).fetchone()[0]
+        
+        # 时间冲突检测逻辑（需根据实际时间格式实现）
+        return any(self._time_overlap(existing[0], new_time) for existing in enrolled)
+    
+    def _check_prerequisites(self, student_id: str, course_code: str) -> bool:
+        """检查先修课程要求"""
+        prerequisite = self.db.execute(
+            "SELECT prerequisite FROM courses WHERE course_code = ?",
+            (course_code,)
+        ).fetchone()[0]
+        
+        if not prerequisite:
+            return True
+        
+        required_courses = [c.strip() for c in prerequisite.split(',')]
+        query = '''SELECT course_code FROM enrollments 
+                 WHERE student_id = ? AND course_code IN ({seq})
+                 AND status = '已完成' '''.format(
+                     seq=','.join(['?']*len(required_courses))
+        completed = self.db.execute(query, (student_id, *required_courses)).fetchall()
+        
+        return len(completed) >= len(required_courses)
+
+class GradeManager:
+    """成绩管理模块"""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+    
+    def submit_grade(self, student_id: str, course_code: str, score: float):
+        """提交成绩（需审核）"""
+        query = '''INSERT OR REPLACE INTO grades 
+                 (student_id, course_code, score, status)
+                 VALUES (?, ?, ?, '待审核')'''
+        self.db.execute(query, (student_id, course_code, score))
+    
+    def approve_grade(self, course_code: str, approver: str):
+        """审核通过成绩"""
+        query = '''UPDATE grades SET status = '已审核',
+                 audit_log = audit_log || ? 
+                 WHERE course_code = ? AND status = '待审核' '''
+        log_entry = f"\n{datetime.now()} 审核人：{approver}"
+        self.db.execute(query, (log_entry, course_code))
+    
+    def calculate_gpa(self, student_id: str) -> float:
+        """计算学生GPA"""
+        query = '''SELECT c.credit, g.score 
+                 FROM grades g
+                 JOIN courses c ON g.course_code = c.course_code
+                 WHERE g.student_id = ? AND g.status = '已审核' '''
+        results = self.db.execute(query, (student_id,)).fetchall()
+        
+        total_points = 0.0
+        total_credits = 0.0
+        for credit, score in results:
+            grade_point = self._score_to_gpa(score)
+            total_points += credit * grade_point
+            total_credits += credit
+        
+        return round(total_points / total_credits, 2) if total_credits else 0.0
+    
+    def _score_to_gpa(self, score: float) -> float:
+        """分数转GPA（4.0制）"""
+        if score >= 90: return 4.0
+        elif score >= 85: return 3.7
+        elif score >= 82: return 3.3
+        elif score >= 78: return 3.0
+        elif score >= 75: return 2.7
+        elif score >= 72: return 2.3
+        elif score >= 68: return 2.0
+        elif score >= 64: return 1.5
+        elif score >= 60: return 1.0
+        else: return 0.0
+
+class ReportGenerator:
+    """报表生成模块"""
+    @staticmethod
+    def student_transcript(student_id: str, db: DatabaseManager) -> pd.DataFrame:
+        """生成学生成绩单"""
+        query = '''SELECT c.name, c.credit, g.score, 
+                 c.course_type, c.semester
+                 FROM grades g
+                 JOIN courses c ON g.course_code = c.course_code
+                 WHERE g.student_id = ? AND g.status = '已审核'
+                 ORDER BY c.semester'''
+        data = db.execute(query, (student_id,)).fetchall()
+        return pd.DataFrame(data, columns=['课程名称', '学分', '成绩', '类型', '学期'])
+    
+    @staticmethod
+    def credit_summary(student_id: str, db: DatabaseManager) -> Dict:
+        """学分统计"""
+        df = ReportGenerator.student_transcript(student_id, db)
+        summary = {
+            'total': df['学分'].sum(),
+            'required': df[df['类型'] == '必修']['学分'].sum(),
+            'elective': df[df['类型'] == '选修']['学分'].sum()
+        }
+        summary['remaining'] = 160 - summary['total']  # 假设毕业要求160学分
+        return summary
+
+# 示例用法
+if __name__ == "__main__":
+    db = DatabaseManager()
+    
+    # 初始化测试数据
+    course_data = {
+        'course_code': 'CS101',
+        'name': '计算机基础',
+        'credit': 3.0,
+        'course_type': '必修',
+        'semester': '2023-秋季',
+        'prerequisite': '',
+        'time_slot': '周一-1,2'
+    }
+    CourseManager(db).add_course(course_data)
+    
+    # 学生选课
+    enroll_mgr = EnrollmentManager(db)
+    if enroll_mgr.enroll_course('S1001', 'CS101'):
+        print("选课成功")
+    else:
+        print("选课失败（冲突或未满足先修条件）")
+    
+    # 成绩录入与审核
+    grade_mgr = GradeManager(db)
+    grade_mgr.submit_grade('S1001', 'CS101', 85.5)
+    grade_mgr.approve_grade('CS101', '教务主任')
+    
+    # 生成成绩单
+    transcript = ReportGenerator.student_transcript('S1001', db)
+    print("\n学生成绩单：")
+    print(transcript)
+    
+    # 计算GPA
+    print(f"\n当前GPA: {grade_mgr.calculate_gpa('S1001')}")
+    
+    # 学分统计
+    credits = ReportGenerator.credit_summary('S1001', db)
+    print("\n学分统计：")
+    print(f"已获学分：{credits['total']}（必修 {credits['required']}，选修 {credits['elective']}）")
+    print(f"剩余所需学分：{credits['remaining']}")

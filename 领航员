@@ -1,0 +1,354 @@
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+
+# 数据库初始化脚本
+DB_SCHEMA = [
+    '''CREATE TABLE IF NOT EXISTS students (
+        student_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        gender TEXT CHECK(gender IN ('男', '女')),
+        class TEXT,
+        enroll_date DATE,
+        credits_earned REAL DEFAULT 0
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS teachers (
+        teacher_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT,
+        courses TEXT  -- 存储任教课程代码，逗号分隔
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS courses (
+        course_code TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        credit REAL,
+        course_type TEXT CHECK(course_type IN ('必修', '选修')),
+        semester TEXT,
+        prerequisite TEXT,
+        time_slot TEXT  -- 格式：星期几-节次（如 周一-1,2）
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS enrollments (
+        student_id TEXT,
+        course_code TEXT,
+        enrollment_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT CHECK(status IN ('已选', '已退', '已完成')),
+        PRIMARY KEY (student_id, course_code),
+        FOREIGN KEY(student_id) REFERENCES students(student_id),
+        FOREIGN KEY(course_code) REFERENCES courses(course_code)
+    )''',
+    
+    '''CREATE TABLE IF NOT EXISTS grades (
+        student_id TEXT,
+        course_code TEXT,
+        score REAL CHECK(score BETWEEN 0 AND 100),
+        status TEXT DEFAULT '待审核',
+        audit_log TEXT,
+        PRIMARY KEY (student_id, course_code)
+    )'''
+]
+
+class DatabaseManager:
+    """数据库管理类，负责连接管理和初始化"""
+    def __init__(self, db_name: str = 'school.db') -> None:
+        self.conn: sqlite3.Connection = sqlite3.connect(db_name)
+        self._initialize_db()
+    
+    def _initialize_db(self) -> None:
+        """初始化数据库表结构"""
+        cursor: sqlite3.Cursor = self.conn.cursor()
+        for statement in DB_SCHEMA:
+            cursor.execute(statement)
+        self.conn.commit()
+    
+    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        """执行SQL语句，包含异常处理"""
+        try:
+            cursor: sqlite3.Cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            self.conn.commit()
+            return cursor
+        except sqlite3.Error as e:
+            print(f"数据库操作失败：{e}")
+            raise
+
+class CourseManager:
+    """课程管理模块，负责课程的增删改查"""
+    def __init__(self, db: DatabaseManager) -> None:
+        self.db: DatabaseManager = db
+    
+    def add_course(self, course_data: Dict) -> None:
+        """
+        添加新课程
+        :param course_data: 课程信息字典，包含course_code/name/credit等字段
+        """
+        query: str = '''INSERT INTO courses 
+                 (course_code, name, credit, course_type, semester, prerequisite, time_slot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'''
+        self.db.execute(query, tuple(course_data.values()))
+    
+    def get_course_schedule(self, course_code: str) -> Optional[Dict]:
+        """
+        获取课程时间安排
+        :param course_code: 课程代码
+        :return: 包含time_slot的字典，失败返回None
+        """
+        query: str = "SELECT time_slot FROM courses WHERE course_code = ?"
+        result: tuple = self.db.execute(query, (course_code,)).fetchone()
+        return {'time_slot': result[0]} if result else None
+
+class EnrollmentManager:
+    """选课管理模块，处理学生选课逻辑"""
+    def __init__(self, db: DatabaseManager) -> None:
+        self.db: DatabaseManager = db
+    
+    def enroll_course(self, student_id: str, course_code: str) -> bool:
+        """
+        学生选课接口
+        :param student_id: 学生学号
+        :param course_code: 课程代码
+        :return: 选课成功返回True，失败返回False
+        """
+        if self._check_schedule_conflict(student_id, course_code):
+            print("选课失败：时间冲突")
+            return False
+        
+        if not self._check_prerequisites(student_id, course_code):
+            print("选课失败：未满足先修课程要求")
+            return False
+        
+        try:
+            query: str = '''INSERT INTO enrollments 
+                         (student_id, course_code, status)
+                         VALUES (?, ?, '已选')'''
+            self.db.execute(query, (student_id, course_code))
+            return True
+        except sqlite3.IntegrityError:
+            print("选课失败：已选过该课程")
+            return False
+    
+    def _check_schedule_conflict(self, student_id: str, new_course: str) -> bool:
+        """
+        检测选课时间冲突（私有方法）
+        :param student_id: 学生学号
+        :param new_course: 新课程代码
+        :return: 存在冲突返回True
+        """
+        # 获取已选课程时间
+        query: str = '''SELECT c.time_slot 
+                 FROM enrollments e
+                 JOIN courses c ON e.course_code = c.course_code
+                 WHERE e.student_id = ? AND e.status = '已选' '''
+        enrolled: List[tuple] = self.db.execute(query, (student_id,)).fetchall()
+        
+        # 获取新课程时间
+        new_time: str = self.db.execute(
+            "SELECT time_slot FROM courses WHERE course_code = ?",
+            (new_course,)
+        ).fetchone()[0] if self.db.execute(...).fetchone() else ""
+        
+        return any(self._time_overlap(existing[0], new_time) for existing in enrolled)
+    
+    @staticmethod
+    def _time_overlap(existing: str, new: str) -> bool:
+        """
+        时间冲突检测逻辑（静态方法）
+        :param existing: 已选课程时间字符串
+        :param new: 新课程时间字符串
+        :return: 冲突返回True
+        """
+        if not existing or not new:
+            return False
+        e_week, e_periods = existing.split('-')
+        n_week, n_periods = new.split('-')
+        return e_week == n_week and set(e_periods.split(',')).intersection(set(n_periods.split(',')))
+    
+    def _check_prerequisites(self, student_id: str, course_code: str) -> bool:
+        """
+        先修课程验证（私有方法）
+        :param student_id: 学生学号
+        :param course_code: 课程代码
+        :return: 满足条件返回True
+        """
+        prerequisite: str = self.db.execute(
+            "SELECT prerequisite FROM courses WHERE course_code = ?",
+            (course_code,)
+        ).fetchone()[0] or ""
+        
+        required_courses: List[str] = [c.strip() for c in prerequisite.split(',') if c.strip()]
+        if not required_courses:
+            return True
+        
+        placeholders: str = ','.join(['?'] * len(required_courses))
+        query: str = f'''SELECT course_code FROM enrollments 
+                 WHERE student_id = ? AND course_code IN ({placeholders})
+                 AND status = '已完成' '''
+        completed: List[tuple] = self.db.execute(query, (student_id, *required_courses)).fetchall()
+        
+        return len(completed) == len(required_courses)
+
+class GradeManager:
+    """成绩管理模块，处理成绩提交、审核和分析"""
+    def __init__(self, db: DatabaseManager) -> None:
+        self.db: DatabaseManager = db
+    
+    def submit_grade(self, student_id: str, course_code: str, score: float) -> None:
+        """
+        提交成绩（待审核状态）
+        :param student_id: 学生学号
+        :param course_code: 课程代码
+        :param score: 成绩（0-100）
+        """
+        if not (0 <= score <= 100):
+            raise ValueError("成绩必须在0-100之间")
+        query: str = '''INSERT OR REPLACE INTO grades 
+                 (student_id, course_code, score, status)
+                 VALUES (?, ?, ?, '待审核')'''
+        self.db.execute(query, (student_id, course_code, score))
+    
+    def approve_grade(self, course_code: str, approver: str) -> None:
+        """
+        审核通过成绩（更新状态并记录日志）
+        :param course_code: 课程代码
+        :param approver: 审核人姓名
+        """
+        log_entry: str = f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 审核人：{approver}"
+        query: str = '''UPDATE grades SET status = '已审核',
+                 audit_log = COALESCE(audit_log, '') || ? 
+                 WHERE course_code = ? AND status = '待审核' '''
+        self.db.execute(query, (log_entry, course_code))
+    
+    def calculate_gpa(self, student_id: str) -> float:
+        """
+        计算学生GPA（4.0制）
+        :param student_id: 学生学号
+        :return: 平均绩点，保留两位小数
+        """
+        query: str = '''SELECT c.credit, g.score 
+                 FROM grades g
+                 JOIN courses c ON g.course_code = c.course_code
+                 WHERE g.student_id = ? AND g.status = '已审核' '''
+        results: List[tuple] = self.db.execute(query, (student_id,)).fetchall()
+        
+        total_points: float = 0.0
+        total_credits: float = 0.0
+        for credit, score in results:
+            grade_point: float = self._score_to_gpa(score)
+            total_points += credit * grade_point
+            total_credits += credit
+        
+        return round(total_points / total_credits, 2) if total_credits else 0.0
+    
+    @staticmethod
+    def _score_to_gpa(score: float) -> float:
+        """
+        分数转GPA映射（静态方法）
+        :param score: 原始成绩
+        :return: GPA值
+        """
+        if score >= 90:
+            return 4.0
+        elif score >= 85:
+            return 3.7
+        elif score >= 82:
+            return 3.3
+        elif score >= 78:
+            return 3.0
+        elif score >= 75:
+            return 2.7
+        elif score >= 72:
+            return 2.3
+        elif score >= 68:
+            return 2.0
+        elif score >= 64:
+            return 1.5
+        elif score >= 60:
+            return 1.0
+        else:
+            return 0.0
+
+class ReportGenerator:
+    """报表生成模块，负责成绩单和统计报表"""
+    @staticmethod
+    def student_transcript(student_id: str, db: DatabaseManager) -> pd.DataFrame:
+        """
+        生成学生成绩单（DataFrame格式）
+        :param student_id: 学生学号
+        :param db: 数据库连接对象
+        :return: 包含课程信息的DataFrame
+        """
+        query: str = '''SELECT c.name, c.credit, g.score, 
+                 c.course_type, c.semester
+                 FROM grades g
+                 JOIN courses c ON g.course_code = c.course_code
+                 WHERE g.student_id = ? AND g.status = '已审核'
+                 ORDER BY c.semester'''
+        data: List[tuple] = db.execute(query, (student_id,)).fetchall()
+        return pd.DataFrame(data, columns=['课程名称', '学分', '成绩', '类型', '学期'])
+    
+    @staticmethod
+    def credit_summary(student_id: str, db: DatabaseManager) -> Dict:
+        """
+        学分统计（包含必修/选修分布）
+        :param student_id: 学生学号
+        :param db: 数据库连接对象
+        :return: 学分统计字典
+        """
+        df: pd.DataFrame = ReportGenerator.student_transcript(student_id, db)
+        total: float = df['学分'].sum()
+        required: float = df[df['类型'] == '必修']['学分'].sum()
+        elective: float = df[df['类型'] == '选修']['学分'].sum()
+        return {
+            'total': round(total, 2),
+            'required': round(required, 2),
+            'elective': round(elective, 2),
+            'remaining': round(160 - total, 2)  # 假设毕业要求160学分
+        }
+
+# 主函数：系统测试入口
+if __name__ == "__main__":
+    # 初始化数据库
+    db: DatabaseManager = DatabaseManager()
+    
+    # 测试数据：添加课程
+    course_info: Dict = {
+        'course_code': 'CS201',
+        'name': '数据结构',
+        'credit': 4.0,
+        'course_type': '必修',
+        'semester': '2024-春季',
+        'prerequisite': 'CS101',
+        'time_slot': '周二-3,4'
+    }
+    course_mgr: CourseManager = CourseManager(db)
+    course_mgr.add_course(course_info)
+    
+    # 测试数据：学生选课（S1001为存在的学生学号）
+    enroll_mgr: EnrollmentManager = EnrollmentManager(db)
+    if enroll_mgr.enroll_course('S1001', 'CS201'):
+        print("选课成功！")
+    else:
+        print("选课失败！")
+    
+    # 测试数据：提交并审核成绩
+    grade_mgr: GradeManager = GradeManager(db)
+    grade_mgr.submit_grade('S1001', 'CS201', 92.0)
+    grade_mgr.approve_grade('CS201', '王老师')
+    
+    # 生成成绩单
+    transcript: pd.DataFrame = ReportGenerator.student_transcript('S1001', db)
+    print("\n学生成绩单：")
+    print(transcript)
+    
+    # 计算GPA
+    gpa: float = grade_mgr.calculate_gpa('S1001')
+    print(f"\n当前GPA：{gpa}")
+    
+    # 学分统计
+    credits: Dict = ReportGenerator.credit_summary('S1001', db)
+    print("\n学分统计：")
+    print(f"总学分：{credits['total']}，必修：{credits['required']}，选修：{credits['elective']}")
+    print(f"剩余学分：{credits['remaining']}")
